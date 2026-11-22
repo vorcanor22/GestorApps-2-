@@ -6,14 +6,17 @@ plugins {
 
 android {
     namespace = "com.vorcanor.gestorapps"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.vorcanor.gestorapps"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        targetSdk = 36
+
+        versionCode = 2
+        versionName = "2.0-beta"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildFeatures {
