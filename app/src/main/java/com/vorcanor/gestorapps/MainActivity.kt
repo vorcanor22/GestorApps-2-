@@ -5,6 +5,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.net.Uri
+import android.provider.Settings
 import android.os.Bundle
 import android.widget.ImageView
 import androidx.activity.ComponentActivity
@@ -324,8 +325,8 @@ fun GestorAppsApp() {
                     }
                 },
                 onSettings = {
-                    val intent = Intent(
-                        Intent.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    val Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                         Uri.parse("package:${app.packageName}")
                     )
 
