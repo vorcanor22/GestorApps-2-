@@ -5,8 +5,8 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.net.Uri
-import android.provider.Settings
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.ImageView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -23,6 +23,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -63,7 +64,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun GestorAppsApp() {
 
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
     var apps by remember {
@@ -94,12 +95,17 @@ fun GestorAppsApp() {
         scope.launch {
             loading = true
 
-            val result = withContext(Dispatchers.IO) {
-                getInstalledApps(context.packageManager)
-            }
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    getInstalledApps(context.packageManager)
+                }
 
-            apps = result
-            loading = false
+                apps = result
+            } catch (e: Exception) {
+                apps = emptyList()
+            } finally {
+                loading = false
+            }
         }
     }
 
@@ -145,39 +151,43 @@ fun GestorAppsApp() {
 
         Scaffold(
             containerColor = Background,
+
             topBar = {
                 TopAppBar(
                     title = {
                         Column {
                             Text(
-                                "GestorApps",
+                                text = "GestorApps",
                                 color = MainText,
                                 fontSize = 23.sp
                             )
 
                             Text(
-                                "Administrador de aplicaciones",
+                                text = "Administrador de aplicaciones",
                                 color = SecondaryText,
                                 fontSize = 12.sp
                             )
                         }
                     },
+
                     actions = {
                         IconButton(
                             onClick = { loadApps() }
                         ) {
                             Icon(
-                                Icons.Default.Refresh,
+                                imageVector = Icons.Default.Refresh,
                                 contentDescription = "Actualizar",
                                 tint = Accent
                             )
                         }
                     },
+
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = Background
                     )
                 )
             }
+
         ) { padding ->
 
             Column(
@@ -191,17 +201,21 @@ fun GestorAppsApp() {
                     value = search,
                     onValueChange = { search = it },
                     modifier = Modifier.fillMaxWidth(),
+
                     placeholder = {
                         Text("Buscar aplicaciones...")
                     },
+
                     leadingIcon = {
                         Icon(
-                            Icons.Default.Search,
-                            contentDescription = null
+                            imageVector = Icons.Default.Search,
+                            contentDescription = "Buscar"
                         )
                     },
+
                     singleLine = true,
                     shape = RoundedCornerShape(16.dp),
+
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = Accent,
                         unfocusedBorderColor = Color.DarkGray,
@@ -245,7 +259,7 @@ fun GestorAppsApp() {
                 ) {
 
                     Text(
-                        "${visibleApps.size} aplicaciones",
+                        text = "${visibleApps.size} aplicaciones",
                         color = SecondaryText,
                         fontSize = 13.sp
                     )
@@ -254,7 +268,7 @@ fun GestorAppsApp() {
                         onClick = { ascending = !ascending }
                     ) {
                         Text(
-                            if (ascending) "A-Z" else "Z-A",
+                            text = if (ascending) "A-Z" else "Z-A",
                             color = Accent
                         )
                     }
@@ -263,6 +277,7 @@ fun GestorAppsApp() {
                 Spacer(Modifier.height(8.dp))
 
                 when {
+
                     loading -> {
                         Box(
                             modifier = Modifier.fillMaxSize(),
@@ -280,7 +295,7 @@ fun GestorAppsApp() {
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                "No se encontraron aplicaciones",
+                                text = "No se encontraron aplicaciones",
                                 color = SecondaryText
                             )
                         }
@@ -291,6 +306,7 @@ fun GestorAppsApp() {
                             verticalArrangement = Arrangement.spacedBy(10.dp),
                             contentPadding = PaddingValues(bottom = 24.dp)
                         ) {
+
                             items(
                                 items = visibleApps,
                                 key = { it.packageName }
@@ -313,32 +329,36 @@ fun GestorAppsApp() {
 
             AppDetailsDialog(
                 app = app,
+
                 onDismiss = {
                     selectedApp = null
                 },
+
                 onOpen = {
-                    val intent = context.packageManager
+                    val launchIntent = context.packageManager
                         .getLaunchIntentForPackage(app.packageName)
 
-                    if (intent != null) {
-                        context.startActivity(intent)
+                    if (launchIntent != null) {
+                        context.startActivity(launchIntent)
                     }
                 },
+
                 onSettings = {
-                    val Intent(
+                    val settingsIntent = Intent(
                         Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                         Uri.parse("package:${app.packageName}")
                     )
 
-                    context.startActivity(intent)
+                    context.startActivity(settingsIntent)
                 },
+
                 onUninstall = {
-                    val intent = Intent(
+                    val uninstallIntent = Intent(
                         Intent.ACTION_DELETE,
                         Uri.parse("package:${app.packageName}")
                     )
 
-                    context.startActivity(intent)
+                    context.startActivity(uninstallIntent)
                 }
             )
         }
@@ -355,7 +375,9 @@ fun AppCard(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onClick() },
+
         shape = RoundedCornerShape(17.dp),
+
         colors = CardDefaults.cardColors(
             containerColor = CardColor
         )
@@ -365,6 +387,7 @@ fun AppCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(14.dp),
+
             verticalAlignment = Alignment.CenterVertically
         ) {
 
@@ -374,9 +397,11 @@ fun AppCard(
                         scaleType = ImageView.ScaleType.FIT_CENTER
                     }
                 },
+
                 update = {
                     it.setImageDrawable(app.icon)
                 },
+
                 modifier = Modifier.size(45.dp)
             )
 
@@ -387,7 +412,7 @@ fun AppCard(
             ) {
 
                 Text(
-                    app.name,
+                    text = app.name,
                     color = MainText,
                     fontSize = 15.sp
                 )
@@ -395,7 +420,7 @@ fun AppCard(
                 Spacer(Modifier.height(3.dp))
 
                 Text(
-                    app.packageName,
+                    text = app.packageName,
                     color = SecondaryText,
                     fontSize = 10.sp,
                     maxLines = 1
@@ -403,7 +428,7 @@ fun AppCard(
             }
 
             Text(
-                if (app.isSystem) "Sistema" else "Usuario",
+                text = if (app.isSystem) "Sistema" else "Usuario",
                 color = Accent,
                 fontSize = 10.sp
             )
@@ -422,31 +447,34 @@ fun AppDetailsDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+
         containerColor = CardColor,
+
         title = {
             Text(
-                app.name,
+                text = app.name,
                 color = MainText
             )
         },
+
         text = {
             Column(
                 verticalArrangement = Arrangement.spacedBy(9.dp)
             ) {
 
                 Text(
-                    "Paquete: ${app.packageName}",
+                    text = "Paquete: ${app.packageName}",
                     color = SecondaryText,
                     fontSize = 12.sp
                 )
 
                 Text(
-                    "Versión: ${app.version}",
+                    text = "Versión: ${app.version}",
                     color = SecondaryText
                 )
 
                 Text(
-                    if (app.isSystem) {
+                    text = if (app.isSystem) {
                         "Aplicación del sistema"
                     } else {
                         "Aplicación de usuario"
@@ -455,14 +483,14 @@ fun AppDetailsDialog(
                 )
             }
         },
-        confirmButton = {
 
+        confirmButton = {
             TextButton(onClick = onOpen) {
                 Text("Abrir", color = Accent)
             }
         },
-        dismissButton = {
 
+        dismissButton = {
             Row {
 
                 TextButton(onClick = onSettings) {
@@ -471,7 +499,10 @@ fun AppDetailsDialog(
 
                 if (!app.isSystem) {
                     TextButton(onClick = onUninstall) {
-                        Text("Desinstalar", color = Color(0xFFFF7777))
+                        Text(
+                            "Desinstalar",
+                            color = Color(0xFFFF7777)
+                        )
                     }
                 }
             }
@@ -489,7 +520,9 @@ private fun getInstalledApps(
 
         try {
 
-            val name = packageManager.getApplicationLabel(info).toString()
+            val name = packageManager
+                .getApplicationLabel(info)
+                .toString()
 
             val packageInfo = packageManager.getPackageInfo(
                 info.packageName,
@@ -509,7 +542,7 @@ private fun getInstalledApps(
                 version = version
             )
 
-        } catch (exception: Exception) {
+        } catch (e: Exception) {
             null
         }
 
