@@ -1,6 +1,15 @@
 package com.vorcanor.gestorapps
 
 import android.content.Intent
+import android.content.Context
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import android.app.AppOpsManager
+import android.app.usage.StorageStatsManager
+import android.os.BatteryManager
+import android.os.Build
+import android.os.Process
+import android.os.storage.StorageManager
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
@@ -27,6 +36,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -39,16 +53,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.graphics.drawable.toBitmap
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-
-// ─────────────────────────────────────────────────────────────
-// COLORES
-// ─────────────────────────────────────────────────────────────
 
 private val Bg = Color(0xFF0B0C11)
 private val Surface1 = Color(0xFF151720)
@@ -58,29 +66,45 @@ private val PurpleSoft = Color(0xFFC4B3FF)
 private val Green = Color(0xFF5CDBA0)
 private val Blue = Color(0xFF6CB8FF)
 private val Orange = Color(0xFFFFB86C)
-private val Red = Color(0xFFFF727D)
 private val MainText = Color(0xFFF4F3FA)
 private val Muted = Color(0xFF9396A8)
 
-// ─────────────────────────────────────────────────────────────
-// MODELOS
-// ─────────────────────────────────────────────────────────────
-
-data class InstalledApp(
+private data class InstalledApp(
     val name: String,
     val packageName: String,
     val version: String,
     val isSystem: Boolean,
-    val icon: Drawable
-)
+    val icon: Drawable,
+    val apkBytes: Long? = null,
+    val dataBytes: Long? = null,
+    val cacheBytes: Long? = null
+) {
+    val totalBytes: Long?
+        get() = if (apkBytes != null && dataBytes != null && cacheBytes != null)
+            apkBytes + dataBytes + cacheBytes else null
+}
 
-data class DeviceStorage(
+private data class DeviceStorage(
     val total: Long,
     val used: Long,
-    val free: Long
+    val free: Long,
+    val apps: Long = 0,
+    val appData: Long = 0,
+    val cache: Long = 0,
+    val other: Long = 0
 )
 
-data class SelectedApk(
+private data class BatteryInfo(
+    val level: Int,
+    val scale: Int,
+    val status: Int,
+    val health: Int,
+    val temperature: Float,
+    val voltage: Float,
+    val hoursLeft: Double?
+)
+
+private data class SelectedApk(
     val uri: Uri,
     val name: String,
     val packageName: String,
@@ -89,161 +113,214 @@ data class SelectedApk(
     val icon: Drawable?
 )
 
-// ─────────────────────────────────────────────────────────────
-// ACTIVITY
-// ─────────────────────────────────────────────────────────────
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         setContent {
             GestorAppsRoot()
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-// APLICACIÓN PRINCIPAL
-// ─────────────────────────────────────────────────────────────
-
 @Composable
 fun GestorAppsRoot() {
     val context = LocalContext.current
     val pm = context.packageManager
+    val scope = rememberCoroutineScope()
 
-    var currentTab by remember { mutableIntStateOf(0) }
-    var installedApps by remember { mutableStateOf<List<InstalledApp>>(emptyList()) }
-    var deviceStorage by remember { mutableStateOf<DeviceStorage?>(null) }
+    var tab by remember { mutableIntStateOf(0) }
+    var installed by remember { mutableStateOf<List<InstalledApp>>(emptyList()) }
+    var storage by remember { mutableStateOf<DeviceStorage?>(null) }
     var selectedApp by remember { mutableStateOf<InstalledApp?>(null) }
     var selectedApk by remember { mutableStateOf<SelectedApk?>(null) }
-    var searchText by remember { mutableStateOf("") }
-    var appFilter by remember { mutableStateOf("Todas") }
+    var search by remember { mutableStateOf("") }
+    var filter by remember { mutableStateOf("Todas") }
     var sortAZ by remember { mutableStateOf(true) }
     var loading by remember { mutableStateOf(false) }
-    var lastRefresh by remember { mutableStateOf("") }
+    var updatedAt by remember { mutableStateOf("") }
+    var usageAccess by remember { mutableStateOf(hasUsageAccess(context)) }
+    var battery by remember { mutableStateOf(readBatteryInfo(context)) }
 
-    fun refreshData() {
+    fun refresh() {
+        if (loading) return
         loading = true
 
-        try {
-            val apps = pm.getInstalledApplications(0).mapNotNull { info ->
-                try {
-                    val packageInfo = pm.getPackageInfo(info.packageName, 0)
-                    InstalledApp(
-                        name = pm.getApplicationLabel(info).toString(),
-                        packageName = info.packageName,
-                        version = packageInfo.versionName ?: "Desconocida",
-                        isSystem = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
-                                (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0,
-                        icon = pm.getApplicationIcon(info)
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                val access = hasUsageAccess(context)
+
+                val apps = try {
+                    pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                        .mapNotNull { info ->
+                            try {
+                                val pi = pm.getPackageInfo(info.packageName, 0)
+
+                                val stats = if (access) {
+                                    queryPackageStorage(context, info.packageName)
+                                } else null
+
+                                InstalledApp(
+                                    pm.getApplicationLabel(info).toString(),
+                                    info.packageName,
+                                    pi.versionName ?: "—",
+                                    (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0 ||
+                                        (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0,
+                                    pm.getApplicationIcon(info),
+                                    stats?.first,
+                                    stats?.second,
+                                    stats?.third
+                                )
+                            } catch (_: Exception) {
+                                null
+                            }
+                        }
+                        .sortedBy { it.name.lowercase(Locale.getDefault()) }
+                } catch (_: Exception) {
+                    emptyList()
+                }
+
+                val stat = try {
+                    val fs = StatFs(Environment.getDataDirectory().absolutePath)
+                    val total = fs.totalBytes
+                    val free = fs.availableBytes
+
+                    val appBytes = apps.sumOf { it.apkBytes ?: 0L }
+                    val dataBytes = apps.sumOf { it.dataBytes ?: 0L }
+                    val cacheBytes = apps.sumOf { it.cacheBytes ?: 0L }
+
+                    DeviceStorage(
+                        total,
+                        (total - free).coerceAtLeast(0),
+                        free,
+                        appBytes,
+                        dataBytes,
+                        cacheBytes,
+                        (total - free - appBytes - dataBytes - cacheBytes)
+                            .coerceAtLeast(0)
                     )
                 } catch (_: Exception) {
                     null
                 }
+
+                Triple(apps, stat, access)
             }
 
-            installedApps = apps.sortedBy { it.name.lowercase(Locale.getDefault()) }
-        } catch (_: Exception) {
-            installedApps = emptyList()
+            installed = result.first
+            storage = result.second
+            usageAccess = result.third
+            battery = readBatteryInfo(context)
+            updatedAt = SimpleDateFormat(
+                "HH:mm",
+                Locale.getDefault()
+            ).format(Date())
+
+            loading = false
+        }
+    }
+
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, intent: Intent?) {
+                battery = readBatteryInfo(context, intent)
+            }
         }
 
-        try {
-            val stat = StatFs(Environment.getDataDirectory().absolutePath)
-            val total = stat.totalBytes
-            val free = stat.availableBytes
-            deviceStorage = DeviceStorage(
-                total = total,
-                used = (total - free).coerceAtLeast(0),
-                free = free
-            )
-        } catch (_: Exception) {
-            deviceStorage = null
-        }
+        val filterIntent = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
 
-        lastRefresh = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
-        loading = false
+        ContextCompat.registerReceiver(
+            context,
+            receiver,
+            filterIntent,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+
+        onDispose {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (_: Exception) {
+            }
+        }
     }
 
     LaunchedEffect(Unit) {
-        refreshData()
+        refresh()
     }
 
-    val filteredApps = installedApps
-        .filter { app ->
-            val searchMatches = app.name.contains(searchText, ignoreCase = true) ||
-                    app.packageName.contains(searchText, ignoreCase = true)
-
-            val filterMatches = when (appFilter) {
-                "Usuario" -> !app.isSystem
-                "Sistema" -> app.isSystem
-                else -> true
-            }
-
-            searchMatches && filterMatches
-        }
-        .let { list ->
-            if (sortAZ) list.sortedBy { it.name.lowercase(Locale.getDefault()) }
-            else list.sortedByDescending { it.name.lowercase(Locale.getDefault()) }
-        }
-
     val apkPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
+        ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
             try {
-                val tempFile = File(context.cacheDir, "gestorapps_selected.apk")
+                val temp = File(context.cacheDir, "gestorapps_chosen.apk")
 
                 context.contentResolver.openInputStream(uri)?.use { input ->
-                    tempFile.outputStream().use { output ->
+                    temp.outputStream().use { output ->
                         input.copyTo(output)
                     }
                 }
 
-                val archiveInfo = pm.getPackageArchiveInfo(
-                    tempFile.absolutePath,
+                val archive = pm.getPackageArchiveInfo(
+                    temp.absolutePath,
                     PackageManager.GET_ACTIVITIES
                 )
 
-                if (archiveInfo != null) {
-                    val archiveAppInfo = archiveInfo.applicationInfo
-                    archiveAppInfo?.sourceDir = tempFile.absolutePath
-                    archiveAppInfo?.publicSourceDir = tempFile.absolutePath
+                if (archive != null) {
+                    val ai = archive.applicationInfo
+                    ai.sourceDir = temp.absolutePath
+                    ai.publicSourceDir = temp.absolutePath
 
-                    val appLabel = if (archiveAppInfo != null) {
-                        pm.getApplicationLabel(archiveAppInfo).toString()
-                    } else {
-                        tempFile.name
+                    val label = try {
+                        pm.getApplicationLabel(ai).toString()
+                    } catch (_: Exception) {
+                        temp.name
                     }
 
-                    val apkIcon = try {
-                        if (archiveAppInfo != null) pm.getApplicationIcon(archiveAppInfo)
-                        else null
+                    val icon = try {
+                        pm.getApplicationIcon(ai)
                     } catch (_: Exception) {
                         null
                     }
 
                     selectedApk = SelectedApk(
-                        uri = uri,
-                        name = appLabel,
-                        packageName = archiveInfo.packageName ?: "Desconocido",
-                        version = archiveInfo.versionName ?: "Desconocida",
-                        size = tempFile.length(),
-                        icon = apkIcon
+                        uri,
+                        label,
+                        archive.packageName ?: "Desconocido",
+                        archive.versionName ?: "—",
+                        temp.length(),
+                        icon
                     )
                 } else {
                     selectedApk = SelectedApk(
-                        uri = uri,
-                        name = tempFile.name,
-                        packageName = "No reconocido",
-                        version = "No disponible",
-                        size = tempFile.length(),
-                        icon = null
+                        uri,
+                        temp.name,
+                        "APK no reconocido",
+                        "—",
+                        temp.length(),
+                        null
                     )
                 }
             } catch (_: Exception) {
                 selectedApk = null
             }
+        }
+    }
+
+    val visibleApps = installed.filter { app ->
+        val matches = app.name.contains(search, true) ||
+            app.packageName.contains(search, true)
+
+        val filterMatches = when (filter) {
+            "Usuario" -> !app.isSystem
+            "Sistema" -> app.isSystem
+            else -> true
+        }
+
+        matches && filterMatches
+    }.let {
+        if (sortAZ) {
+            it.sortedBy { app -> app.name.lowercase(Locale.getDefault()) }
+        } else {
+            it.sortedByDescending { app -> app.name.lowercase(Locale.getDefault()) }
         }
     }
 
@@ -260,115 +337,132 @@ fun GestorAppsRoot() {
             bottomBar = {
                 NavigationBar(
                     containerColor = Surface1,
-                    contentColor = MainText,
                     tonalElevation = 0.dp
                 ) {
                     NavigationBarItem(
-                        selected = currentTab == 0,
-                        onClick = { currentTab = 0 },
-                        icon = {
-                            Icon(Icons.Default.DonutLarge, contentDescription = null)
-                        },
+                        tab == 0,
+                        { tab = 0 },
+                        icon = { Icon(Icons.Default.DonutLarge, null) },
                         label = { Text("Espacio") },
                         colors = navColors()
                     )
 
                     NavigationBarItem(
-                        selected = currentTab == 1,
-                        onClick = { currentTab = 1 },
-                        icon = {
-                            Icon(Icons.Default.Apps, contentDescription = null)
-                        },
+                        tab == 1,
+                        { tab = 1 },
+                        icon = { Icon(Icons.Default.Apps, null) },
                         label = { Text("Aplicaciones") },
                         colors = navColors()
                     )
 
                     NavigationBarItem(
-                        selected = currentTab == 2,
-                        onClick = { currentTab = 2 },
-                        icon = {
-                            Icon(Icons.Default.Folder, contentDescription = null)
-                        },
+                        tab == 2,
+                        { tab = 2 },
+                        icon = { Icon(Icons.Default.Folder, null) },
                         label = { Text("Paquetes") },
+                        colors = navColors()
+                    )
+
+                    NavigationBarItem(
+                        tab == 3,
+                        { tab = 3 },
+                        icon = { Icon(Icons.Default.BatteryFull, null) },
+                        label = { Text("Batería") },
                         colors = navColors()
                     )
                 }
             }
         ) { padding ->
             Box(
-                modifier = Modifier
+                Modifier
                     .fillMaxSize()
                     .padding(padding)
             ) {
-                when (currentTab) {
-                    0 -> StorageTab(
-                        storage = deviceStorage,
-                        appCount = installedApps.size,
-                        loading = loading,
-                        lastRefresh = lastRefresh,
-                        onRefresh = { refreshData() }
+                when (tab) {
+                    0 -> StorageScreen(
+                        storage,
+                        installed.size,
+                        loading,
+                        updatedAt,
+                        ::refresh,
+                        usageAccess,
+                        {
+                            try {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                                )
+                            } catch (_: Exception) {
+                            }
+                        }
                     )
 
-                    1 -> ApplicationsTab(
-                        apps = filteredApps,
-                        total = installedApps.size,
-                        search = searchText,
-                        onSearch = { searchText = it },
-                        filter = appFilter,
-                        onFilter = { appFilter = it },
-                        sortAZ = sortAZ,
-                        onSort = { sortAZ = !sortAZ },
-                        onRefresh = { refreshData() },
-                        lastRefresh = lastRefresh,
-                        onAppClick = { selectedApp = it }
+                    1 -> AppsScreen(
+                        visibleApps,
+                        installed.size,
+                        search,
+                        { search = it },
+                        filter,
+                        { filter = it },
+                        sortAZ,
+                        { sortAZ = !sortAZ },
+                        ::refresh,
+                        { selectedApp = it }
                     )
 
-                    2 -> PackagesTab(
-                        selectedApk = selectedApk,
-                        onSelectApk = {
-                            apkPicker.launch(arrayOf("application/vnd.android.package-archive"))
+                    2 -> PackagesScreen(
+                        selectedApk,
+                        {
+                            apkPicker.launch(
+                                arrayOf("application/vnd.android.package-archive")
+                            )
                         },
-                        onRemoveApk = { selectedApk = null },
-                        onInstall = {
+                        { selectedApk = null },
+                        {
                             selectedApk?.let { item ->
                                 try {
-                                    val installIntent = Intent(Intent.ACTION_VIEW).apply {
-                                        setDataAndType(
-                                            item.uri,
-                                            "application/vnd.android.package-archive"
-                                        )
-                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                    }
-                                    context.startActivity(installIntent)
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW).apply {
+                                            setDataAndType(
+                                                item.uri,
+                                                "application/vnd.android.package-archive"
+                                            )
+                                            addFlags(
+                                                Intent.FLAG_GRANT_READ_URI_PERMISSION
+                                            )
+                                        }
+                                    )
                                 } catch (_: Exception) {
                                 }
                             }
                         },
-                        installedApps = installedApps.size,
-                        onRefresh = { refreshData() }
+                        installed.size,
+                        ::refresh
                     )
+
+                    else -> BatteryScreen(battery, ::refresh)
                 }
             }
         }
 
         selectedApp?.let { app ->
-            ApplicationDetailsDialog(
-                app = app,
-                onDismiss = { selectedApp = null },
-                onOpen = {
+            AppDetailsDialog(
+                app,
+                { selectedApp = null },
+                {
                     try {
-                        pm.getLaunchIntentForPackage(app.packageName)?.let {
-                            context.startActivity(it)
-                        }
+                        pm.getLaunchIntentForPackage(app.packageName)
+                            ?.let(context::startActivity)
                     } catch (_: Exception) {
                     }
                 },
-                onAndroidSettings = {
+                {
                     try {
-                        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                            data = Uri.parse("package:${app.packageName}")
-                        }
-                        context.startActivity(intent)
+                        context.startActivity(
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:${app.packageName}")
+                            )
+                        )
                     } catch (_: Exception) {
                     }
                 }
@@ -377,137 +471,283 @@ fun GestorAppsRoot() {
     }
 }
 
-@Composable
-private fun navColors() = NavigationBarItemDefaults.colors(
-    selectedIconColor = PurpleSoft,
-    selectedTextColor = PurpleSoft,
-    indicatorColor = Color(0xFF30264A),
-    unselectedIconColor = Muted,
-    unselectedTextColor = Muted
-)
+@Suppress("DEPRECATION")
+private fun hasUsageAccess(context: Context): Boolean {
+    return try {
+        val ops = context.getSystemService(
+            Context.APP_OPS_SERVICE
+        ) as AppOpsManager
 
-// ─────────────────────────────────────────────────────────────
-// PANTALLA: ALMACENAMIENTO
-// ─────────────────────────────────────────────────────────────
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ops.unsafeCheckOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS,
+                Process.myUid(),
+                context.packageName
+            )
+        } else {
+            ops.checkOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS,
+                Process.myUid(),
+                context.packageName
+            )
+        }
+
+        mode == AppOpsManager.MODE_ALLOWED
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private fun queryPackageStorage(
+    context: Context,
+    packageName: String
+): Triple<Long, Long, Long>? {
+    return try {
+        val manager = context.getSystemService(
+            Context.STORAGE_STATS_SERVICE
+        ) as StorageStatsManager
+
+        val stats = manager.queryStatsForPackage(
+            StorageManager.UUID_DEFAULT,
+            packageName,
+            Process.myUserHandle()
+        )
+
+        Triple(
+            stats.appBytes,
+            stats.dataBytes,
+            stats.cacheBytes
+        )
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun readBatteryInfo(
+    context: Context,
+    intent: Intent? = null
+): BatteryInfo {
+    val data = intent ?: context.registerReceiver(
+        null,
+        IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+    )
+
+    val level = data?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+    val scale = data?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+
+    val manager = context.getSystemService(
+        Context.BATTERY_SERVICE
+    ) as BatteryManager
+
+    val charge = manager.getLongProperty(
+        BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER
+    )
+
+    val current = manager.getLongProperty(
+        BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE
+    )
+
+    val hours = if (
+        charge > 0 &&
+        current != Long.MIN_VALUE &&
+        abs(current) > 0
+    ) {
+        charge.toDouble() / abs(current).toDouble()
+    } else {
+        null
+    }
+
+    return BatteryInfo(
+        level,
+        scale,
+        data?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1,
+        data?.getIntExtra(BatteryManager.EXTRA_HEALTH, -1) ?: -1,
+        (data?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1) / 10f,
+        (data?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1) ?: -1) / 1000f,
+        hours
+    )
+}
 
 @Composable
-fun StorageTab(
+private fun navColors() =
+    NavigationBarItemDefaults.colors(
+        selectedIconColor = PurpleSoft,
+        selectedTextColor = PurpleSoft,
+        indicatorColor = Color(0xFF30264A),
+        unselectedIconColor = Muted,
+        unselectedTextColor = Muted
+    )
+
+// STORAGE SCREEN
+
+@Composable
+fun StorageScreen(
     storage: DeviceStorage?,
     appCount: Int,
     loading: Boolean,
-    lastRefresh: String,
-    onRefresh: () -> Unit
+    updatedAt: String,
+    onRefresh: () -> Unit,
+    usageAccess: Boolean,
+    onGrantAccess: () -> Unit
 ) {
     Column(
-        modifier = Modifier
+        Modifier
             .fillMaxSize()
             .background(Bg)
             .padding(horizontal = 20.dp)
     ) {
-        ScreenHeader(
-            eyebrow = "VORCANOR",
-            title = "Almacenamiento",
-            onRefresh = onRefresh
-        )
+        ScreenHeader("VORCANOR", "Almacenamiento", onRefresh)
 
         if (storage == null) {
-            EmptyStorage(loading)
+            Box(
+                Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                if (loading) {
+                    CircularProgressIndicator(color = Purple)
+                } else {
+                    Text(
+                        "No se pudo leer el almacenamiento",
+                        color = Muted
+                    )
+                }
+            }
             return
         }
 
         LazyColumn(
-            modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(15.dp)
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {
-                Spacer(Modifier.height(2.dp))
                 StorageRingCard(storage)
             }
 
             item {
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
                     StorageStat(
-                        title = "Ocupado",
-                        value = formatBytes(storage.used),
-                        color = Purple,
-                        modifier = Modifier.weight(1f)
+                        "Ocupado",
+                        formatBytes(storage.used),
+                        Purple,
+                        Modifier.weight(1f)
                     )
+
                     StorageStat(
-                        title = "Disponible",
-                        value = formatBytes(storage.free),
-                        color = Green,
-                        modifier = Modifier.weight(1f)
+                        "Disponible",
+                        formatBytes(storage.free),
+                        Green,
+                        Modifier.weight(1f)
                     )
                 }
             }
 
             item {
-                SectionTitle("Uso del dispositivo", "Resumen general")
-            }
-
-            item {
-                StorageCategory(
-                    title = "Aplicaciones",
-                    subtitle = "$appCount aplicaciones instaladas",
-                    value = null,
-                    icon = Icons.Default.Apps,
-                    color = Purple
+                SectionTitle(
+                    "Uso del dispositivo",
+                    "Resumen general"
                 )
             }
 
             item {
-                StorageCategory(
-                    title = "Imágenes y vídeos",
-                    subtitle = "Categoría disponible en el sistema",
-                    value = null,
-                    icon = Icons.Default.Image,
-                    color = Blue
+                SectionTitle(
+                    "Desglose de aplicaciones",
+                    if (usageAccess) {
+                        "Datos proporcionados por Android"
+                    } else {
+                        "Necesita permiso de acceso al uso"
+                    }
                 )
             }
 
-            item {
-                StorageCategory(
-                    title = "Audio",
-                    subtitle = "Música y archivos de sonido",
-                    value = null,
-                    icon = Icons.Default.MusicNote,
-                    color = Orange
-                )
+            if (!usageAccess) {
+                item {
+                    Card(
+                        Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(18.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = Surface1
+                        )
+                    ) {
+                        Column(Modifier.padding(15.dp)) {
+                            Text(
+                                "Activa el acceso a los datos de uso",
+                                color = MainText,
+                                fontWeight = FontWeight.SemiBold
+                            )
+
+                            Text(
+                                "Android necesita que autorices a GestorApps para consultar el tamaño de cada aplicación.",
+                                color = Muted,
+                                fontSize = 12.sp
+                            )
+
+                            Spacer(Modifier.height(10.dp))
+
+                            Button(
+                                onClick = onGrantAccess,
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Purple
+                                )
+                            ) {
+                                Text("Conceder acceso")
+                            }
+                        }
+                    }
+                }
+            } else {
+                item {
+                    StorageCategory(
+                        "Aplicaciones (APK)",
+                        "$appCount aplicaciones",
+                        formatBytes(storage.apps),
+                        Icons.Default.Apps,
+                        Purple
+                    )
+                }
+
+                item {
+                    StorageCategory(
+                        "Datos de aplicaciones",
+                        "Datos internos y archivos de apps",
+                        formatBytes(storage.appData),
+                        Icons.Default.Folder,
+                        Blue
+                    )
+                }
+
+                item {
+                    StorageCategory(
+                        "Caché de aplicaciones",
+                        "Archivos temporales de apps",
+                        formatBytes(storage.cache),
+                        Icons.Default.Cached,
+                        Orange
+                    )
+                }
+
+                item {
+                    StorageCategory(
+                        "Sistema y otros",
+                        "Espacio restante no atribuido a apps",
+                        formatBytes(storage.other),
+                        Icons.Default.Storage,
+                        Green
+                    )
+                }
+
+                item {
+                    InfoNote(
+                        "Las cifras por aplicación proceden de StorageStatsManager. Android puede limitar u ocultar datos de algunos paquetes; por eso el total de categorías puede no coincidir exactamente con el almacenamiento ocupado."
+                    )
+                }
             }
 
-            item {
-                StorageCategory(
-                    title = "Documentos y descargas",
-                    subtitle = "Archivos guardados en el dispositivo",
-                    value = null,
-                    icon = Icons.Default.Description,
-                    color = Green
-                )
-            }
-
-            item {
-                StorageCategory(
-                    title = "Otros",
-                    subtitle = "Sistema, datos y contenido no clasificado",
-                    value = null,
-                    icon = Icons.Default.Folder,
-                    color = Red
-                )
-            }
-
-            item {
-                InfoNote(
-                    "El almacenamiento total, ocupado y libre es real. " +
-                        "El desglose por categorías no está disponible con precisión " +
-                        "mediante los permisos actuales de Android."
-                )
-            }
-
-            if (lastRefresh.isNotBlank()) {
+            if (updatedAt.isNotBlank()) {
                 item {
                     Text(
-                        "Última actualización: $lastRefresh",
+                        "Actualizado: $updatedAt",
                         color = Muted,
                         fontSize = 11.sp,
                         modifier = Modifier.padding(start = 4.dp)
@@ -520,66 +760,71 @@ fun StorageTab(
 
 @Composable
 fun StorageRingCard(storage: DeviceStorage) {
-    val percentage = if (storage.total > 0) {
-        (storage.used.toFloat() / storage.total.toFloat()).coerceIn(0f, 1f)
-    } else 0f
+    val fraction = if (storage.total > 0) {
+        (storage.used.toFloat() / storage.total).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
 
-    val animatedPercentage by animateFloatAsState(
-        targetValue = percentage,
-        label = "storage_ring"
+    val animated by animateFloatAsState(
+        fraction,
+        label = "storageRing"
     )
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(28.dp),
         colors = CardDefaults.cardColors(containerColor = Surface1)
     ) {
         Column(
-            modifier = Modifier
+            Modifier
                 .fillMaxWidth()
-                .padding(vertical = 20.dp, horizontal = 16.dp),
+                .padding(vertical = 18.dp, horizontal = 14.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Box(
-                modifier = Modifier.size(230.dp),
+                Modifier.size(226.dp),
                 contentAlignment = Alignment.Center
             ) {
-                Canvas(modifier = Modifier.fillMaxSize()) {
+                Canvas(Modifier.fillMaxSize()) {
                     drawArc(
-                        color = Surface2,
-                        startAngle = -90f,
-                        sweepAngle = 360f,
-                        useCenter = false,
-                        style = Stroke(width = 22.dp.toPx())
+                        Surface2,
+                        -90f,
+                        360f,
+                        false,
+                        style = Stroke(21.dp.toPx())
                     )
 
                     drawArc(
-                        color = Purple,
-                        startAngle = -90f,
-                        sweepAngle = 360f * animatedPercentage,
-                        useCenter = false,
-                        style = Stroke(width = 22.dp.toPx())
+                        Purple,
+                        -90f,
+                        360f * animated,
+                        false,
+                        style = Stroke(21.dp.toPx())
                     )
                 }
 
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        "${(percentage * 100).toInt()}%",
+                        "${(fraction * 100).toInt()}%",
                         color = MainText,
                         fontSize = 43.sp,
                         fontWeight = FontWeight.ExtraBold
                     )
-                    Text("utilizado", color = Muted, fontSize = 14.sp)
+
+                    Text("ocupado", color = Muted, fontSize = 14.sp)
+
                     Spacer(Modifier.height(6.dp))
+
                     Text(
-                        "${formatBytes(storage.used)} de ${formatBytes(storage.total)}",
+                        "${formatBytes(storage.used)} / ${formatBytes(storage.total)}",
                         color = PurpleSoft,
                         fontSize = 12.sp
                     )
                 }
             }
 
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(8.dp))
 
             Text(
                 "Almacenamiento interno",
@@ -601,23 +846,25 @@ fun StorageRingCard(storage: DeviceStorage) {
 fun StorageStat(
     title: String,
     value: String,
-    color: Color,
+    accent: Color,
     modifier: Modifier = Modifier
 ) {
     Card(
-        modifier = modifier,
+        modifier,
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = Surface1)
     ) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(15.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     Modifier
-                        .size(9.dp)
+                        .size(8.dp)
                         .clip(CircleShape)
-                        .background(color)
+                        .background(accent)
                 )
+
                 Spacer(Modifier.width(7.dp))
+
                 Text(title, color = Muted, fontSize = 12.sp)
             }
 
@@ -643,18 +890,18 @@ fun StorageCategory(
     color: Color
 ) {
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(19.dp),
         colors = CardDefaults.cardColors(containerColor = Surface1)
     ) {
         Row(
-            modifier = Modifier.padding(15.dp),
+            Modifier.padding(14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
-                modifier = Modifier
-                    .size(44.dp)
-                    .clip(RoundedCornerShape(14.dp))
+                Modifier
+                    .size(43.dp)
+                    .clip(RoundedCornerShape(13.dp))
                     .background(Surface2),
                 contentAlignment = Alignment.Center
             ) {
@@ -664,37 +911,34 @@ fun StorageCategory(
             Spacer(Modifier.width(12.dp))
 
             Column(Modifier.weight(1f)) {
-                Text(title, color = MainText, fontWeight = FontWeight.SemiBold)
-                Text(subtitle, color = Muted, fontSize = 12.sp)
+                Text(
+                    title,
+                    color = MainText,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Text(
+                    subtitle,
+                    color = Muted,
+                    fontSize = 11.sp
+                )
             }
 
-            if (value != null) {
-                Text(value, color = MainText, fontWeight = FontWeight.Bold)
+            value?.let {
+                Text(
+                    it,
+                    color = MainText,
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
     }
 }
 
-@Composable
-fun EmptyStorage(loading: Boolean) {
-    Box(
-        Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        if (loading) {
-            CircularProgressIndicator(color = Purple)
-        } else {
-            Text("No se pudo leer el almacenamiento", color = Muted)
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
-// PANTALLA: APLICACIONES
-// ─────────────────────────────────────────────────────────────
+// APPLICATIONS SCREEN
 
 @Composable
-fun ApplicationsTab(
+fun AppsScreen(
     apps: List<InstalledApp>,
     total: Int,
     search: String,
@@ -704,20 +948,15 @@ fun ApplicationsTab(
     sortAZ: Boolean,
     onSort: () -> Unit,
     onRefresh: () -> Unit,
-    lastRefresh: String,
     onAppClick: (InstalledApp) -> Unit
 ) {
     Column(
-        modifier = Modifier
+        Modifier
             .fillMaxSize()
             .background(Bg)
             .padding(horizontal = 18.dp)
     ) {
-        ScreenHeader(
-            eyebrow = "VORCANOR",
-            title = "Aplicaciones",
-            onRefresh = onRefresh
-        )
+        ScreenHeader("VORCANOR", "Aplicaciones", onRefresh)
 
         Text(
             "$total aplicaciones instaladas",
@@ -725,25 +964,35 @@ fun ApplicationsTab(
             fontSize = 13.sp
         )
 
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(13.dp))
 
         OutlinedTextField(
             value = search,
             onValueChange = onSearch,
             modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("Buscar aplicaciones", color = Muted) },
+            placeholder = {
+                Text("Buscar aplicaciones", color = Muted)
+            },
             leadingIcon = {
-                Icon(Icons.Default.Search, null, tint = PurpleSoft)
+                Icon(
+                    Icons.Default.Search,
+                    null,
+                    tint = PurpleSoft
+                )
             },
             trailingIcon = {
                 if (search.isNotEmpty()) {
                     IconButton(onClick = { onSearch("") }) {
-                        Icon(Icons.Default.Close, "Limpiar", tint = Muted)
+                        Icon(
+                            Icons.Default.Close,
+                            "Limpiar",
+                            tint = Muted
+                        )
                     }
                 }
             },
             singleLine = true,
-            shape = RoundedCornerShape(17.dp),
+            shape = RoundedCornerShape(16.dp),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = Purple,
                 unfocusedBorderColor = Surface2,
@@ -753,22 +1002,19 @@ fun ApplicationsTab(
             )
         )
 
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(10.dp))
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
             Row(
-                modifier = Modifier.weight(1f),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                Modifier.weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 listOf("Todas", "Usuario", "Sistema").forEach { option ->
                     FilterChip(
                         selected = filter == option,
                         onClick = { onFilter(option) },
-                        label = { Text(option, fontSize = 12.sp) },
-                        shape = RoundedCornerShape(13.dp),
+                        label = { Text(option, fontSize = 11.sp) },
+                        shape = RoundedCornerShape(12.dp),
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = Purple,
                             selectedLabelColor = Color.White,
@@ -782,33 +1028,41 @@ fun ApplicationsTab(
             IconButton(onClick = onSort) {
                 Icon(
                     if (sortAZ) Icons.Default.SortByAlpha else Icons.Default.Sort,
-                    contentDescription = "Cambiar orden",
+                    "Ordenar",
                     tint = PurpleSoft
                 )
             }
         }
 
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(5.dp))
 
         if (apps.isEmpty()) {
             Box(
-                modifier = Modifier.fillMaxSize(),
+                Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(Icons.Default.SearchOff, null, tint = Muted, modifier = Modifier.size(42.dp))
+                    Icon(
+                        Icons.Default.Search,
+                        null,
+                        tint = Muted,
+                        modifier = Modifier.size(42.dp)
+                    )
+
                     Spacer(Modifier.height(8.dp))
-                    Text("No se encontraron aplicaciones", color = Muted)
+
+                    Text("No hay resultados", color = Muted)
                 }
             }
         } else {
             LazyColumn(
-                modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(7.dp),
                 contentPadding = PaddingValues(bottom = 20.dp)
             ) {
                 items(apps, key = { it.packageName }) { app ->
-                    ApplicationRow(app = app, onClick = { onAppClick(app) })
+                    AppRow(app) {
+                        onAppClick(app)
+                    }
                 }
             }
         }
@@ -816,22 +1070,19 @@ fun ApplicationsTab(
 }
 
 @Composable
-fun ApplicationRow(
-    app: InstalledApp,
-    onClick: () -> Unit
-) {
+fun AppRow(app: InstalledApp, onClick: () -> Unit) {
     Card(
-        modifier = Modifier
+        Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick),
-        shape = RoundedCornerShape(19.dp),
+        shape = RoundedCornerShape(18.dp),
         colors = CardDefaults.cardColors(containerColor = Surface1)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp),
+            Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            DrawableIcon(app.icon, Modifier.size(48.dp))
+            DrawableIcon(app.icon, Modifier.size(47.dp))
 
             Spacer(Modifier.width(12.dp))
 
@@ -845,7 +1096,11 @@ fun ApplicationRow(
                 )
 
                 Text(
-                    if (app.isSystem) "Aplicación del sistema" else "Aplicación de usuario",
+                    if (app.isSystem) {
+                        "Aplicación del sistema"
+                    } else {
+                        "Aplicación de usuario"
+                    },
                     color = Muted,
                     fontSize = 11.sp
                 )
@@ -856,129 +1111,167 @@ fun ApplicationRow(
                     fontSize = 11.sp,
                     maxLines = 1
                 )
+
+                Text(
+                    app.totalBytes?.let {
+                        "Tamaño: ${formatBytes(it)}"
+                    } ?: "Tamaño: no disponible",
+                    color = if (app.totalBytes != null) Green else Muted,
+                    fontSize = 11.sp,
+                    maxLines = 1
+                )
             }
 
-            Icon(Icons.Default.ChevronRight, null, tint = Muted)
+            Icon(
+                Icons.Default.ChevronRight,
+                null,
+                tint = Muted
+            )
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-// PANTALLA: PAQUETES APK
-// ─────────────────────────────────────────────────────────────
+// PACKAGES SCREEN
 
 @Composable
-fun PackagesTab(
+fun PackagesScreen(
     selectedApk: SelectedApk?,
-    onSelectApk: () -> Unit,
-    onRemoveApk: () -> Unit,
+    onSelect: () -> Unit,
+    onRemove: () -> Unit,
     onInstall: () -> Unit,
     installedApps: Int,
     onRefresh: () -> Unit
 ) {
     Column(
-        modifier = Modifier
+        Modifier
             .fillMaxSize()
             .background(Bg)
             .padding(horizontal = 20.dp)
     ) {
-        ScreenHeader(
-            eyebrow = "VORCANOR",
-            title = "Paquetes APK",
-            onRefresh = onRefresh
-        )
+        ScreenHeader("VORCANOR", "Paquetes APK", onRefresh)
 
         Text(
-            "Analiza archivos APK e inicia su instalación.",
+            "Selecciona y analiza un APK antes de instalarlo.",
             color = Muted,
             fontSize = 13.sp
         )
 
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(17.dp))
 
         Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(23.dp),
+            Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(22.dp),
             colors = CardDefaults.cardColors(containerColor = Surface1)
         ) {
-            Column(Modifier.padding(19.dp)) {
+            Column(Modifier.padding(18.dp)) {
                 Box(
                     Modifier
-                        .size(58.dp)
-                        .clip(RoundedCornerShape(18.dp))
+                        .size(54.dp)
+                        .clip(RoundedCornerShape(16.dp))
                         .background(Surface2),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Default.Android, null, tint = PurpleSoft, modifier = Modifier.size(32.dp))
+                    Icon(
+                        Icons.Default.Android,
+                        null,
+                        tint = PurpleSoft,
+                        modifier = Modifier.size(31.dp)
+                    )
                 }
 
-                Spacer(Modifier.height(14.dp))
+                Spacer(Modifier.height(12.dp))
 
                 Text(
                     "Instalador de paquetes",
                     color = MainText,
-                    fontSize = 20.sp,
+                    fontSize = 19.sp,
                     fontWeight = FontWeight.Bold
                 )
 
                 Text(
-                    "Selecciona un APK de tus archivos para consultar sus datos antes de instalarlo.",
+                    "Selecciona un archivo APK de tu dispositivo.",
                     color = Muted,
-                    fontSize = 13.sp
+                    fontSize = 12.sp
                 )
 
-                Spacer(Modifier.height(17.dp))
+                Spacer(Modifier.height(16.dp))
 
                 Button(
-                    onClick = onSelectApk,
-                    modifier = Modifier
+                    onSelect,
+                    Modifier
                         .fillMaxWidth()
-                        .height(53.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Purple)
+                        .height(52.dp),
+                    shape = RoundedCornerShape(15.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Purple
+                    )
                 ) {
                     Icon(Icons.Default.FolderOpen, null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Elegir archivo APK", fontWeight = FontWeight.Bold)
+                    Text(
+                        "Elegir archivo APK",
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
         }
 
-        Spacer(Modifier.height(15.dp))
+        Spacer(Modifier.height(13.dp))
 
         Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(20.dp),
+            Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(19.dp),
             colors = CardDefaults.cardColors(containerColor = Surface1)
         ) {
             Row(
-                Modifier.padding(16.dp),
+                Modifier.padding(15.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Default.Apps, null, tint = Blue, modifier = Modifier.size(28.dp))
-                Spacer(Modifier.width(12.dp))
+                Icon(
+                    Icons.Default.Apps,
+                    null,
+                    tint = Blue,
+                    modifier = Modifier.size(27.dp)
+                )
+
+                Spacer(Modifier.width(10.dp))
+
                 Column(Modifier.weight(1f)) {
-                    Text("Paquetes instalados", color = MainText, fontWeight = FontWeight.SemiBold)
-                    Text("$installedApps aplicaciones detectadas", color = Muted, fontSize = 12.sp)
+                    Text(
+                        "Apps instaladas",
+                        color = MainText,
+                        fontWeight = FontWeight.SemiBold
+                    )
+
+                    Text(
+                        "$installedApps paquetes detectados",
+                        color = Muted,
+                        fontSize = 11.sp
+                    )
                 }
+
                 IconButton(onClick = onRefresh) {
-                    Icon(Icons.Default.Refresh, null, tint = PurpleSoft)
+                    Icon(
+                        Icons.Default.Refresh,
+                        null,
+                        tint = PurpleSoft
+                    )
                 }
             }
         }
 
-        Spacer(Modifier.height(15.dp))
+        Spacer(Modifier.height(13.dp))
 
         if (selectedApk == null) {
             Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(22.dp),
+                Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = Surface1)
             ) {
                 Column(
-                    modifier = Modifier
+                    Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 28.dp, horizontal = 18.dp),
+                        .padding(25.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Icon(
@@ -990,30 +1283,27 @@ fun PackagesTab(
 
                     Spacer(Modifier.height(10.dp))
 
-                    Text("Ningún APK seleccionado", color = MainText, fontWeight = FontWeight.SemiBold)
-
-                    Spacer(Modifier.height(5.dp))
+                    Text(
+                        "Ningún APK seleccionado",
+                        color = MainText,
+                        fontWeight = FontWeight.SemiBold
+                    )
 
                     Text(
-                        "Los detalles del paquete aparecerán aquí.",
+                        "Selecciona un archivo para ver sus datos.",
                         color = Muted,
                         fontSize = 12.sp
                     )
                 }
             }
         } else {
-            SelectedApkCard(
-                apk = selectedApk,
-                onInstall = onInstall,
-                onRemove = onRemoveApk
-            )
+            SelectedApkCard(selectedApk, onInstall, onRemove)
         }
 
-        Spacer(Modifier.height(15.dp))
+        Spacer(Modifier.height(14.dp))
 
         InfoNote(
-            "La instalación se realiza mediante Android. " +
-                "GestorApps no instala paquetes en segundo plano ni evita las confirmaciones del sistema."
+            "Android abrirá su instalador y pedirá confirmación. GestorApps no instala aplicaciones silenciosamente ni evita protecciones del sistema."
         )
     }
 }
@@ -1025,90 +1315,333 @@ fun SelectedApkCard(
     onRemove: () -> Unit
 ) {
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(containerColor = Surface1)
     ) {
-        Column(Modifier.padding(17.dp)) {
+        Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (apk.icon != null) {
-                    DrawableIcon(apk.icon, Modifier.size(48.dp))
+                    DrawableIcon(
+                        apk.icon,
+                        Modifier.size(47.dp)
+                    )
                 } else {
                     Box(
                         Modifier
-                            .size(48.dp)
+                            .size(47.dp)
                             .clip(RoundedCornerShape(13.dp))
                             .background(Surface2),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Default.Android, null, tint = PurpleSoft)
+                        Icon(
+                            Icons.Default.Android,
+                            null,
+                            tint = PurpleSoft
+                        )
                     }
                 }
 
-                Spacer(Modifier.width(12.dp))
+                Spacer(Modifier.width(11.dp))
 
                 Column(Modifier.weight(1f)) {
                     Text(
                         apk.name,
                         color = MainText,
                         fontWeight = FontWeight.Bold,
-                        fontSize = 17.sp,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
+                        maxLines = 2
                     )
-                    Text("APK seleccionado", color = Green, fontSize = 12.sp)
+
+                    Text(
+                        "APK seleccionado",
+                        color = Green,
+                        fontSize = 11.sp
+                    )
                 }
             }
 
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(12.dp))
 
             PackageDetailLine("Paquete", apk.packageName)
             PackageDetailLine("Versión", apk.version)
             PackageDetailLine("Tamaño", formatBytes(apk.size))
 
-            Spacer(Modifier.height(15.dp))
+            Spacer(Modifier.height(14.dp))
 
             Button(
-                onClick = onInstall,
-                modifier = Modifier
+                onInstall,
+                Modifier
                     .fillMaxWidth()
-                    .height(52.dp),
-                shape = RoundedCornerShape(15.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Green)
+                    .height(50.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Green
+                )
             ) {
-                Icon(Icons.Default.InstallMobile, null, tint = Bg)
+                Icon(
+                    Icons.Default.InstallMobile,
+                    null,
+                    tint = Bg
+                )
+
                 Spacer(Modifier.width(8.dp))
-                Text("Instalar", color = Bg, fontWeight = FontWeight.Bold)
+
+                Text(
+                    "Instalar APK",
+                    color = Bg,
+                    fontWeight = FontWeight.Bold
+                )
             }
 
             TextButton(
-                onClick = onRemove,
-                modifier = Modifier.align(Alignment.End)
+                onRemove,
+                Modifier.align(Alignment.End)
             ) {
-                Text("Quitar APK", color = Muted)
+                Text("Quitar archivo", color = Muted)
             }
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-// DETALLES DE APP
-// ─────────────────────────────────────────────────────────────
+// BATTERY SCREEN
 
 @Composable
-fun ApplicationDetailsDialog(
+fun BatteryScreen(
+    info: BatteryInfo,
+    onRefresh: () -> Unit
+) {
+    val percent = if (info.level >= 0 && info.scale > 0) {
+        (info.level * 100 / info.scale).coerceIn(0, 100)
+    } else {
+        0
+    }
+
+    val percentLabel = if (info.level >= 0 && info.scale > 0) {
+        "$percent%"
+    } else {
+        "—"
+    }
+
+    val charging =
+        info.status == BatteryManager.BATTERY_STATUS_CHARGING ||
+        info.status == BatteryManager.BATTERY_STATUS_FULL
+
+    val health = when (info.health) {
+        BatteryManager.BATTERY_HEALTH_GOOD -> "Buena"
+        BatteryManager.BATTERY_HEALTH_OVERHEAT -> "Sobrecalentada"
+        BatteryManager.BATTERY_HEALTH_DEAD -> "No funcional"
+        BatteryManager.BATTERY_HEALTH_OVER_VOLTAGE -> "Voltaje excesivo"
+        BatteryManager.BATTERY_HEALTH_COLD -> "Temperatura baja"
+        else -> "No disponible"
+    }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Bg)
+            .padding(horizontal = 20.dp)
+    ) {
+        ScreenHeader("VORCANOR", "Batería", onRefresh)
+
+        LazyColumn(
+            contentPadding = PaddingValues(bottom = 22.dp),
+            verticalArrangement = Arrangement.spacedBy(13.dp)
+        ) {
+            item {
+                Card(
+                    Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(26.dp),
+                    colors = CardDefaults.cardColors(containerColor = Surface1)
+                ) {
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(22.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Box(
+                            Modifier.size(190.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Canvas(Modifier.fillMaxSize()) {
+                                drawArc(
+                                    Surface2,
+                                    -90f,
+                                    360f,
+                                    false,
+                                    style = Stroke(17.dp.toPx())
+                                )
+
+                                drawArc(
+                                    if (charging) Green else Purple,
+                                    -90f,
+                                    360f * percent / 100f,
+                                    false,
+                                    style = Stroke(17.dp.toPx())
+                                )
+                            }
+
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Icon(
+                                    if (charging) {
+                                        Icons.Default.BatteryChargingFull
+                                    } else {
+                                        Icons.Default.BatteryFull
+                                    },
+                                    null,
+                                    tint = if (charging) Green else PurpleSoft,
+                                    modifier = Modifier.size(32.dp)
+                                )
+
+                                Text(
+                                    percentLabel,
+                                    color = MainText,
+                                    fontSize = 38.sp,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+
+                                Text(
+                                    if (charging) "Cargando" else "En uso",
+                                    color = Muted,
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+
+                        Text(
+                            if (charging) {
+                                "Batería conectada"
+                            } else {
+                                "Nivel de batería"
+                            },
+                            color = MainText,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 17.sp
+                        )
+                    }
+                }
+            }
+
+            item {
+                SectionTitle(
+                    "Tiempo estimado",
+                    "Estimación basada en los sensores que expone el dispositivo"
+                )
+            }
+
+            item {
+                val remaining = info.hoursLeft?.let {
+                    String.format(Locale.getDefault(), "%.1f h", it)
+                } ?: "No disponible"
+
+                StorageCategory(
+                    "Autonomía restante",
+                    if (charging) {
+                        "El cálculo de descarga no se aplica mientras carga"
+                    } else {
+                        "Estimación aproximada, puede variar"
+                    },
+                    if (charging) "—" else remaining,
+                    Icons.Default.Schedule,
+                    Blue
+                )
+            }
+
+            item {
+                SectionTitle("Información básica")
+            }
+
+            item {
+                StorageCategory(
+                    "Estado",
+                    when (info.status) {
+                        BatteryManager.BATTERY_STATUS_CHARGING -> "Cargando"
+                        BatteryManager.BATTERY_STATUS_FULL -> "Completa"
+                        BatteryManager.BATTERY_STATUS_DISCHARGING -> "Descargando"
+                        BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "No está cargando"
+                        else -> "Desconocido"
+                    },
+                    null,
+                    Icons.Default.Bolt,
+                    Green
+                )
+            }
+
+            item {
+                StorageCategory(
+                    "Salud",
+                    health,
+                    null,
+                    Icons.Default.FavoriteBorder,
+                    PurpleSoft
+                )
+            }
+
+            item {
+                StorageCategory(
+                    "Temperatura",
+                    if (info.temperature >= 0) {
+                        String.format(
+                            Locale.getDefault(),
+                            "%.1f °C",
+                            info.temperature
+                        )
+                    } else {
+                        "No disponible"
+                    },
+                    null,
+                    Icons.Default.Thermostat,
+                    Orange
+                )
+            }
+
+            item {
+                StorageCategory(
+                    "Voltaje",
+                    if (info.voltage > 0) {
+                        String.format(
+                            Locale.getDefault(),
+                            "%.2f V",
+                            info.voltage
+                        )
+                    } else {
+                        "No disponible"
+                    },
+                    null,
+                    Icons.Default.ElectricBolt,
+                    Blue
+                )
+            }
+
+            item {
+                InfoNote(
+                    "Android y el fabricante deciden qué datos de batería están disponibles. Las horas restantes solo aparecen si el teléfono proporciona lecturas de carga y consumo; no es una predicción exacta."
+                )
+            }
+        }
+    }
+}
+
+// APP DETAILS DIALOG
+
+@Composable
+fun AppDetailsDialog(
     app: InstalledApp,
     onDismiss: () -> Unit,
     onOpen: () -> Unit,
-    onAndroidSettings: () -> Unit
+    onSettings: () -> Unit
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Surface1,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                DrawableIcon(app.icon, Modifier.size(48.dp))
-                Spacer(Modifier.width(12.dp))
+                DrawableIcon(app.icon, Modifier.size(46.dp))
+
+                Spacer(Modifier.width(11.dp))
+
                 Column {
                     Text(
                         app.name,
@@ -1116,10 +1649,15 @@ fun ApplicationDetailsDialog(
                         fontWeight = FontWeight.Bold,
                         maxLines = 2
                     )
+
                     Text(
-                        if (app.isSystem) "Aplicación del sistema" else "Aplicación de usuario",
+                        if (app.isSystem) {
+                            "App del sistema"
+                        } else {
+                            "App de usuario"
+                        },
                         color = PurpleSoft,
-                        fontSize = 12.sp
+                        fontSize = 11.sp
                     )
                 }
             }
@@ -1129,31 +1667,49 @@ fun ApplicationDetailsDialog(
                 PackageDetailLine("Paquete", app.packageName)
                 PackageDetailLine("Versión", app.version)
 
-                Spacer(Modifier.height(10.dp))
+                PackageDetailLine(
+                    "APK",
+                    app.apkBytes?.let(::formatBytes) ?: "No disponible"
+                )
+
+                PackageDetailLine(
+                    "Datos",
+                    app.dataBytes?.let(::formatBytes) ?: "No disponible"
+                )
+
+                PackageDetailLine(
+                    "Caché",
+                    app.cacheBytes?.let(::formatBytes) ?: "No disponible"
+                )
+
+                PackageDetailLine(
+                    "Total",
+                    app.totalBytes?.let(::formatBytes) ?: "No disponible"
+                )
+
+                Spacer(Modifier.height(8.dp))
 
                 Text(
-                    "Android controla el tamaño detallado y las acciones avanzadas desde la información de la aplicación.",
+                    "Los tamaños los facilita Android y pueden variar según permisos y versión del sistema.",
                     color = Muted,
                     fontSize = 12.sp
                 )
             }
         },
         confirmButton = {
-            TextButton(onClick = onOpen) {
+            TextButton(onOpen) {
                 Text("Abrir", color = PurpleSoft)
             }
         },
         dismissButton = {
-            TextButton(onClick = onAndroidSettings) {
-                Text("Ajustes de Android", color = PurpleSoft)
+            TextButton(onSettings) {
+                Text("Ajustes", color = PurpleSoft)
             }
         }
     )
 }
 
-// ─────────────────────────────────────────────────────────────
-// COMPONENTES REUTILIZABLES
-// ─────────────────────────────────────────────────────────────
+// COMMON UI COMPONENTS
 
 @Composable
 fun ScreenHeader(
@@ -1162,29 +1718,34 @@ fun ScreenHeader(
     onRefresh: () -> Unit
 ) {
     Row(
-        modifier = Modifier
+        Modifier
             .fillMaxWidth()
-            .padding(top = 23.dp, bottom = 13.dp),
+            .padding(top = 22.dp, bottom = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f)) {
             Text(
                 eyebrow,
                 color = PurpleSoft,
-                fontSize = 11.sp,
+                fontSize = 10.sp,
                 fontWeight = FontWeight.ExtraBold,
                 letterSpacing = 2.sp
             )
+
             Text(
                 title,
                 color = MainText,
-                fontSize = 27.sp,
+                fontSize = 26.sp,
                 fontWeight = FontWeight.ExtraBold
             )
         }
 
-        IconButton(onClick = onRefresh) {
-            Icon(Icons.Default.Refresh, "Actualizar", tint = PurpleSoft)
+        IconButton(onRefresh) {
+            Icon(
+                Icons.Default.Refresh,
+                "Actualizar",
+                tint = PurpleSoft
+            )
         }
     }
 }
@@ -1192,9 +1753,19 @@ fun ScreenHeader(
 @Composable
 fun SectionTitle(title: String, subtitle: String? = null) {
     Column {
-        Text(title, color = MainText, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Text(
+            title,
+            color = MainText,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold
+        )
+
         if (subtitle != null) {
-            Text(subtitle, color = Muted, fontSize = 12.sp)
+            Text(
+                subtitle,
+                color = Muted,
+                fontSize = 12.sp
+            )
         }
     }
 }
@@ -1202,32 +1773,43 @@ fun SectionTitle(title: String, subtitle: String? = null) {
 @Composable
 fun InfoNote(text: String) {
     Row(
-        modifier = Modifier
+        Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(17.dp))
+            .clip(RoundedCornerShape(16.dp))
             .background(Surface2)
-            .padding(14.dp),
+            .padding(13.dp),
         verticalAlignment = Alignment.Top
     ) {
-        Icon(Icons.Default.Info, null, tint = PurpleSoft, modifier = Modifier.size(18.dp))
-        Spacer(Modifier.width(9.dp))
-        Text(text, color = Muted, fontSize = 12.sp)
+        Icon(
+            Icons.Default.Info,
+            null,
+            tint = PurpleSoft,
+            modifier = Modifier.size(17.dp)
+        )
+
+        Spacer(Modifier.width(8.dp))
+
+        Text(
+            text,
+            color = Muted,
+            fontSize = 11.sp
+        )
     }
 }
 
 @Composable
 fun PackageDetailLine(label: String, value: String) {
     Row(
-        modifier = Modifier
+        Modifier
             .fillMaxWidth()
-            .padding(vertical = 5.dp),
+            .padding(vertical = 4.dp),
         verticalAlignment = Alignment.Top
     ) {
         Text(
             label,
             color = Muted,
             fontSize = 12.sp,
-            modifier = Modifier.width(78.dp)
+            modifier = Modifier.width(76.dp)
         )
 
         Text(
@@ -1245,31 +1827,37 @@ fun DrawableIcon(
     modifier: Modifier = Modifier
 ) {
     val bitmap = remember(drawable) {
-        drawable.toBitmap(width = 96, height = 96).asImageBitmap()
+        drawable.toBitmap(
+            width = 96,
+            height = 96
+        ).asImageBitmap()
     }
 
     Image(
-        bitmap = bitmap,
+        bitmap,
         contentDescription = null,
-        modifier = modifier.clip(RoundedCornerShape(13.dp))
+        modifier = modifier.clip(RoundedCornerShape(12.dp))
     )
 }
 
-// ─────────────────────────────────────────────────────────────
-// UTILIDADES
-// ─────────────────────────────────────────────────────────────
+// FORMATTING HELPERS
 
 fun formatBytes(bytes: Long): String {
     if (bytes <= 0L) return "0 B"
 
     val units = arrayOf("B", "KB", "MB", "GB", "TB")
-    var value = bytes.toDouble()
+    var size = bytes.toDouble()
     var unit = 0
 
-    while (value >= 1024 && unit < units.lastIndex) {
-        value /= 1024.0
+    while (size >= 1024 && unit < units.lastIndex) {
+        size /= 1024
         unit++
     }
 
-    return String.format(Locale.getDefault(), "%.1f %s", value, units[unit])
+    return String.format(
+        Locale.getDefault(),
+        "%.1f %s",
+        size,
+        units[unit]
+    )
 }
